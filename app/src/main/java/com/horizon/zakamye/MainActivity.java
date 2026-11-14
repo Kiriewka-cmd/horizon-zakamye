@@ -33,17 +33,22 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import androidx.webkit.WebViewAssetLoader;
 import java.io.*;
+import java.util.ArrayList;
+import java.util.List;
+import org.json.JSONArray;
+import org.json.JSONObject;
 import java.net.HttpURLConnection;
 import java.net.URL;
 
 public class MainActivity extends Activity {
     // OWNER/REPO подставляется автоматически при сборке в GitHub Actions
     static final String UPDATE_BASE = "https://raw.githubusercontent.com/OWNER/REPO/main/game/";
+    static final String MUSIC_API = "https://api.github.com/repos/OWNER/REPO/contents/game/music";
     static final int BUNDLED_VERSION = 19;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
-    private File gameDir;
+    private File gameDir, musicDir;
     private WebView web;
     private LinearLayout launcher;
     private TextView status, verChip;
@@ -60,6 +65,8 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences("launcher", MODE_PRIVATE);
         gameDir = new File(getFilesDir(), "game");
         gameDir.mkdirs();
+        musicDir = new File(gameDir, "music");
+        musicDir.mkdirs();
 
         initColors();
         FrameLayout root = new FrameLayout(this);
@@ -161,8 +168,56 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 ui.post(() -> status.setText("Нет связи с сервером обновлений — запуск сохранённой версии"));
             }
-            ui.post(() -> { updating = false; bar.setIndeterminate(false); bar.setProgress(100); play.setEnabled(true); check.setEnabled(true); refreshVersionLabel(); });
+            ui.post(() -> { updating = false; bar.setIndeterminate(false); bar.setProgress(100); play.setEnabled(true); refreshVersionLabel(); });
+            syncMusic();
+            ui.post(() -> check.setEnabled(true));
         }).start();
+    }
+
+    /** Скачивает музыку из game/music репозитория в память приложения (только недостающие файлы). Вызывать из фонового потока. */
+    private void syncMusic() {
+        try {
+            HttpURLConnection c = open(MUSIC_API);
+            c.setRequestProperty("User-Agent", "HorizonLauncher");
+            c.setRequestProperty("Accept", "application/vnd.github+json");
+            String json;
+            try (InputStream in = c.getInputStream(); ByteArrayOutputStream o = new ByteArrayOutputStream()) {
+                byte[] buf = new byte[8192]; int n;
+                while ((n = in.read(buf)) > 0) o.write(buf, 0, n);
+                json = o.toString("UTF-8");
+            } finally { c.disconnect(); }
+            JSONArray arr = new JSONArray(json);
+            List<String[]> need = new ArrayList<>();
+            int total = 0;
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                if (!"file".equals(o.optString("type"))) continue;
+                String name = o.getString("name"), low = name.toLowerCase();
+                if (!(low.endsWith(".mp3") || low.endsWith(".ogg") || low.endsWith(".m4a") || low.endsWith(".wav") || low.endsWith(".aac"))) continue;
+                total++;
+                File f = new File(musicDir, name);
+                if (!(f.exists() && f.length() == o.optLong("size", -1))) need.add(new String[]{name, o.getString("download_url")});
+            }
+            if (total == 0) return;
+            final int tot = total;
+            if (need.isEmpty()) { ui.post(() -> status.setText("Музыка: " + tot + " треков ✓")); return; }
+            int ok = 0;
+            for (int i = 0; i < need.size(); i++) {
+                final int idx = i + 1, cnt = need.size();
+                ui.post(() -> { status.setText("Скачивание музыки " + idx + "/" + cnt + "…"); bar.setIndeterminate(false); bar.setProgress(0); });
+                try {
+                    File tmp = new File(musicDir, need.get(i)[0] + ".part");
+                    download(need.get(i)[1], tmp);
+                    File dst = new File(musicDir, need.get(i)[0]);
+                    if (dst.exists()) dst.delete();
+                    if (tmp.renameTo(dst)) ok++;
+                } catch (Exception ignored) { }
+            }
+            final int okf = ok, cnt = need.size();
+            ui.post(() -> { bar.setProgress(100); status.setText(okf == cnt ? "Музыка загружена ✓ (" + tot + " треков)" : "Музыка: скачано " + okf + " из " + cnt + " — повторите проверку"); });
+        } catch (Exception e) {
+            // нет интернета или нет папки game/music — тихо пропускаем
+        }
     }
 
     private String httpString(String u) throws IOException {
@@ -197,6 +252,8 @@ public class MainActivity extends Activity {
     private WebView buildWebView() {
         WebView w = new WebView(this);
         final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()
+                .addPathHandler("/assets/music/", new WebViewAssetLoader.InternalStoragePathHandler(this, musicDir))
+                .addPathHandler("/game/music/", new WebViewAssetLoader.InternalStoragePathHandler(this, musicDir))
                 .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
                 .addPathHandler("/game/", new WebViewAssetLoader.InternalStoragePathHandler(this, gameDir))
                 .build();
