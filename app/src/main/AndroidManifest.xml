@@ -3,7 +3,7 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <application
         android:label="Horizon: Zakamye"
-        android:icon="@drawable/ic_launcher"
+        android:icon="@drawable/app_icon"
         android:allowBackup="true"
         android:hardwareAccelerated="true"
         android:usesCleartextTraffic="false"

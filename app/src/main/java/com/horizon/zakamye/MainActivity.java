@@ -1,6 +1,14 @@
 package com.horizon.zakamye;
 
 import android.app.Activity;
+import android.content.ContentResolver;
+import android.content.ContentValues;
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Environment;
+import android.provider.MediaStore;
+import android.util.Base64;
+import org.json.JSONTokener;
 import android.content.SharedPreferences;
 import android.animation.ObjectAnimator;
 import android.animation.ValueAnimator;
@@ -29,6 +37,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import androidx.webkit.WebViewAssetLoader;
@@ -56,6 +65,10 @@ public class MainActivity extends Activity {
     private Button play, check;
     private int cPrimary, cTertiary, cBg;
     private View launcherRootView;
+    private static final int REQ_RESTORE = 7;
+    private Button restore;
+    private Runnable pendingAfterLoad;
+    private boolean paused = false;
     private boolean gameLoaded = false, updating = false, inGame = false;
 
     @Override
@@ -80,6 +93,13 @@ public class MainActivity extends Activity {
         // --- экран лаунчера: фон + светящиеся пятна + стеклянная карточка ---
         FrameLayout launcherRoot = new FrameLayout(this);
         launcherRoot.setBackgroundColor(cBg);
+        ImageView bg = new ImageView(this);
+        bg.setImageResource(R.drawable.bg_launcher);
+        bg.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        launcherRoot.addView(bg, new FrameLayout.LayoutParams(-1, -1));
+        View scrim = new View(this);
+        scrim.setBackgroundColor(alpha(cBg, 0x70));
+        launcherRoot.addView(scrim, new FrameLayout.LayoutParams(-1, -1));
         launcherRoot.addView(orb(cPrimary, 420, Gravity.TOP | Gravity.START, -120, -120, 7000, 40, 30));
         launcherRoot.addView(orb(cTertiary, 380, Gravity.BOTTOM | Gravity.END, 0, 0, 9000, -50, -30));
         launcherRoot.addView(orb(mix(cPrimary, cTertiary), 300, Gravity.CENTER, 160, -60, 11000, 30, 50));
@@ -126,10 +146,18 @@ public class MainActivity extends Activity {
         card.addView(status, lp(0, 22));
         card.addView(bar, lp2(300, 8, 14));
         card.addView(row, lp2(400, 54, 24));
+        restore = pill("Восстановить сохранение", false);
+        restore.setTextSize(13);
+        restore.setOnClickListener(v -> {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            startActivityForResult(i, REQ_RESTORE);
+        });
+        card.addView(restore, lp2(400, 44, 12));
         LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(dp(460), -2);
         launcher.addView(card, cp);
         root.addView(launcherRoot, new FrameLayout.LayoutParams(-1, -1));
-        launcher = (LinearLayout) launcherRoot.getChildAt(3);
         launcherRootView = launcherRoot;
         refreshVersionLabel();
 
@@ -267,6 +295,9 @@ public class MainActivity extends Activity {
         w.setBackgroundColor(0xFF101827);
         w.setWebChromeClient(new WebChromeClient());
         w.setWebViewClient(new WebViewClient() {
+            @Override public void onPageFinished(WebView v, String url) {
+                if (pendingAfterLoad != null) { Runnable r = pendingAfterLoad; pendingAfterLoad = null; r.run(); }
+            }
             @Override public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
                 return loader.shouldInterceptRequest(r.getUrl());
             }
@@ -276,34 +307,98 @@ public class MainActivity extends Activity {
 
     private void startGame() {
         if (updating) return;
-        if (!gameLoaded) {
-            web.loadUrl(hasLocal() ? "https://appassets.androidplatform.net/game/index.html"
-                                   : "https://appassets.androidplatform.net/assets/index.html");
-            gameLoaded = true;
-        }
+        if (!gameLoaded) loadGame();
         web.setVisibility(View.VISIBLE);
         launcherRootView.setVisibility(View.GONE);
         web.onResume();
         inGame = true;
     }
 
+    private void loadGame() {
+        web.loadUrl(hasLocal() ? "https://appassets.androidplatform.net/game/index.html"
+                               : "https://appassets.androidplatform.net/assets/index.html");
+        gameLoaded = true;
+    }
+
     private void showLauncher() {
-        web.onPause();
+        exportSave();
         web.setVisibility(View.GONE);
         launcherRootView.setVisibility(View.VISIBLE);
         inGame = false;
+        ui.postDelayed(() -> { if (!inGame) web.onPause(); }, 900);
+    }
+
+    // ---------- сохранения: резервная копия localStorage в Documents/HorizonZakamye ----------
+    private void withWeb(Runnable r) {
+        if (gameLoaded) { r.run(); return; }
+        pendingAfterLoad = r;
+        loadGame();
+    }
+
+    /** Снимает копию сохранений игры в Documents/HorizonZakamye/horizon_save.json (Android 10+, без разрешений). */
+    private void exportSave() {
+        if (!gameLoaded) return;
+        web.evaluateJavascript("JSON.stringify(Object.assign({},localStorage))", val -> {
+            try {
+                if (val == null || val.equals("null")) return;
+                String json = (String) new JSONTokener(val).nextValue();
+                if (json == null || json.length() < 3) return;
+                writeBackup(json);
+            } catch (Exception ignored) { }
+        });
+    }
+
+    private void writeBackup(final String json) {
+        if (Build.VERSION.SDK_INT < 29) return;
+        new Thread(() -> {
+            try {
+                ContentResolver cr = getContentResolver();
+                Uri col = MediaStore.Files.getContentUri("external");
+                String rel = Environment.DIRECTORY_DOCUMENTS + "/HorizonZakamye/";
+                cr.delete(col, MediaStore.MediaColumns.DISPLAY_NAME + "=? AND " + MediaStore.MediaColumns.RELATIVE_PATH + "=?",
+                        new String[]{"horizon_save.json", rel});
+                ContentValues v = new ContentValues();
+                v.put(MediaStore.MediaColumns.DISPLAY_NAME, "horizon_save.json");
+                v.put(MediaStore.MediaColumns.MIME_TYPE, "application/json");
+                v.put(MediaStore.MediaColumns.RELATIVE_PATH, rel);
+                Uri u = cr.insert(col, v);
+                if (u == null) return;
+                try (OutputStream o = cr.openOutputStream(u)) { o.write(json.getBytes("UTF-8")); }
+            } catch (Exception ignored) { }
+        }).start();
+    }
+
+    @Override
+    protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req != REQ_RESTORE || res != RESULT_OK || data == null || data.getData() == null) return;
+        try (InputStream in = getContentResolver().openInputStream(data.getData()); ByteArrayOutputStream o = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[8192]; int n;
+            while ((n = in.read(buf)) > 0) o.write(buf, 0, n);
+            byte[] bytes = o.toByteArray();
+            new JSONObject(new String(bytes, "UTF-8")); // проверка, что это JSON
+            final String b64 = Base64.encodeToString(bytes, Base64.NO_WRAP);
+            withWeb(() -> applyRestore(b64));
+        } catch (Exception e) {
+            status.setText("Не удалось прочитать файл сохранения");
+        }
+    }
+
+    private void applyRestore(String b64) {
+        String js = "(function(){try{var b=atob('" + b64 + "');var u=Uint8Array.from(b,function(c){return c.charCodeAt(0)});"
+                + "var d=JSON.parse(new TextDecoder().decode(u));for(var k in d)localStorage.setItem(k,d[k]);return 'ok'}catch(e){return 'err'}})()";
+        web.evaluateJavascript(js, r -> {
+            if (r != null && r.contains("ok")) { status.setText("Сохранение восстановлено ✓"); web.reload(); }
+            else status.setText("Не удалось восстановить сохранение");
+            ui.postDelayed(() -> { if (!inGame) web.onPause(); }, 1500);
+        });
     }
 
 
     // ---------- дизайн: Material You + liquid glass ----------
     private void initColors() {
-        if (Build.VERSION.SDK_INT >= 31) {
-            cPrimary = getColor(android.R.color.system_accent1_200);
-            cTertiary = getColor(android.R.color.system_accent3_200);
-            cBg = getColor(android.R.color.system_neutral1_900);
-        } else {
-            cPrimary = 0xFFD0BCFF; cTertiary = 0xFFEFB8C8; cBg = 0xFF141218;
-        }
+        // зелёная палитра в стиле Material 3 (тёмная тема)
+        cPrimary = 0xFF78DC77; cTertiary = 0xFFA1CED5; cBg = 0xFF0F1511;
     }
     private int mix(int a, int b) {
         return Color.rgb((Color.red(a) + Color.red(b)) / 2, (Color.green(a) + Color.green(b)) / 2, (Color.blue(a) + Color.blue(b)) / 2);
@@ -324,7 +419,7 @@ public class MainActivity extends Activity {
         GradientDrawable g = new GradientDrawable();
         g.setGradientType(GradientDrawable.RADIAL_GRADIENT);
         g.setGradientRadius(dp(sizeDp) / 2f);
-        g.setColors(new int[]{alpha(color, 0xAA), alpha(color, 0x00)});
+        g.setColors(new int[]{alpha(color, 0x60), alpha(color, 0x00)});
         v.setBackground(g);
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(sizeDp), dp(sizeDp), gravity);
         lp.leftMargin = dp(mx); lp.topMargin = dp(my);
@@ -346,7 +441,7 @@ public class MainActivity extends Activity {
             GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[]{cPrimary, mix(cPrimary, cTertiary)});
             g.setCornerRadius(dp(27));
             b.setBackground(g);
-            b.setTextColor(0xFF1B1B1F);
+            b.setTextColor(0xFF00390A);
         } else {
             b.setBackground(glass(dp(27), 0x38, 0x14, 0x77));
             b.setTextColor(Color.WHITE);
@@ -402,8 +497,11 @@ public class MainActivity extends Activity {
     }
 
     @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) immersive(); }
-    @Override protected void onPause() { super.onPause(); web.onPause(); }
-    @Override protected void onResume() { super.onResume(); if (inGame) web.onResume(); immersive(); }
+    @Override protected void onPause() {
+        super.onPause(); paused = true; exportSave();
+        ui.postDelayed(() -> { if (paused) web.onPause(); }, 900);
+    }
+    @Override protected void onResume() { super.onResume(); paused = false; if (inGame) web.onResume(); immersive(); }
     @Override protected void onDestroy() { web.destroy(); super.onDestroy(); }
     @Override public void onBackPressed() { if (inGame) showLauncher(); else super.onBackPressed(); }
 }
