@@ -65,7 +65,8 @@ public class MainActivity extends Activity {
     private Button play, check;
     private int cPrimary, cTertiary, cBg;
     private View launcherRootView;
-    private static final int REQ_RESTORE = 7;
+    private static final int REQ_RESTORE = 7, REQ_SAVE = 8;
+    private String pendingBackupJson;
     private Button restore;
     private Runnable pendingAfterLoad;
     private boolean paused = false;
@@ -146,7 +147,7 @@ public class MainActivity extends Activity {
         card.addView(status, lp(0, 22));
         card.addView(bar, lp2(300, 8, 14));
         card.addView(row, lp2(400, 54, 24));
-        restore = pill("Восстановить сохранение", false);
+        restore = pill("Восстановить", false);
         restore.setTextSize(13);
         restore.setOnClickListener(v -> {
             Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -154,7 +155,19 @@ public class MainActivity extends Activity {
             i.setType("*/*");
             startActivityForResult(i, REQ_RESTORE);
         });
-        card.addView(restore, lp2(400, 44, 12));
+        Button backup = pill("Сохранить копию", false);
+        backup.setTextSize(13);
+        backup.setOnClickListener(v -> manualBackup());
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        row2.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams r1 = new LinearLayout.LayoutParams(0, dp(44), 1f);
+        r1.rightMargin = dp(6);
+        LinearLayout.LayoutParams r2 = new LinearLayout.LayoutParams(0, dp(44), 1f);
+        r2.leftMargin = dp(6);
+        row2.addView(backup, r1);
+        row2.addView(restore, r2);
+        card.addView(row2, lp2(400, 44, 12));
         LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(dp(460), -2);
         launcher.addView(card, cp);
         root.addView(launcherRoot, new FrameLayout.LayoutParams(-1, -1));
@@ -342,14 +355,14 @@ public class MainActivity extends Activity {
             try {
                 if (val == null || val.equals("null")) return;
                 String json = (String) new JSONTokener(val).nextValue();
-                if (json == null || json.length() < 3) return;
+                if (json == null || json.length() < 3) { status.setText("Автокопия: в игре пока нет сохранений"); return; }
                 writeBackup(json);
             } catch (Exception ignored) { }
         });
     }
 
     private void writeBackup(final String json) {
-        if (Build.VERSION.SDK_INT < 29) return;
+        if (Build.VERSION.SDK_INT < 29) { status.setText("Автокопия работает на Android 10+. Используйте «Сохранить копию»"); return; }
         new Thread(() -> {
             try {
                 ContentResolver cr = getContentResolver();
@@ -362,16 +375,28 @@ public class MainActivity extends Activity {
                 v.put(MediaStore.MediaColumns.MIME_TYPE, "application/json");
                 v.put(MediaStore.MediaColumns.RELATIVE_PATH, rel);
                 Uri u = cr.insert(col, v);
-                if (u == null) return;
+                if (u == null) throw new IOException("insert вернул null");
                 try (OutputStream o = cr.openOutputStream(u)) { o.write(json.getBytes("UTF-8")); }
-            } catch (Exception ignored) { }
+                ui.post(() -> status.setText("Копия сохранения обновлена ✓ (Документы/HorizonZakamye)"));
+            } catch (Exception e) {
+                final String m = e.getClass().getSimpleName() + (e.getMessage() != null ? ": " + e.getMessage() : "");
+                ui.post(() -> status.setText("Автокопия не удалась — " + m + ". Используйте «Сохранить копию»"));
+            }
         }).start();
     }
 
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
-        if (req != REQ_RESTORE || res != RESULT_OK || data == null || data.getData() == null) return;
+        if (res != RESULT_OK || data == null || data.getData() == null) return;
+        if (req == REQ_SAVE) {
+            try (OutputStream o = getContentResolver().openOutputStream(data.getData(), "wt")) {
+                o.write(pendingBackupJson.getBytes("UTF-8"));
+                status.setText("Копия сохранена ✓");
+            } catch (Exception e) { status.setText("Не удалось сохранить копию: " + e.getMessage()); }
+            return;
+        }
+        if (req != REQ_RESTORE) return;
         try (InputStream in = getContentResolver().openInputStream(data.getData()); ByteArrayOutputStream o = new ByteArrayOutputStream()) {
             byte[] buf = new byte[8192]; int n;
             while ((n = in.read(buf)) > 0) o.write(buf, 0, n);
@@ -382,6 +407,21 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             status.setText("Не удалось прочитать файл сохранения");
         }
+    }
+
+    private void manualBackup() {
+        withWeb(() -> web.evaluateJavascript("JSON.stringify(Object.assign({},localStorage))", val -> {
+            try {
+                String json = (String) new JSONTokener(val).nextValue();
+                if (json == null || json.length() < 3) { status.setText("В игре пока нет сохранений"); return; }
+                pendingBackupJson = json;
+                Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType("application/json");
+                i.putExtra(Intent.EXTRA_TITLE, "horizon_save.json");
+                startActivityForResult(i, REQ_SAVE);
+            } catch (Exception e) { status.setText("Не удалось прочитать сохранение игры"); }
+        }));
     }
 
     private void applyRestore(String b64) {
