@@ -43,6 +43,10 @@ import android.widget.TextView;
 import androidx.webkit.WebViewAssetLoader;
 import java.io.*;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 import java.util.List;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -52,6 +56,7 @@ import java.net.URL;
 public class MainActivity extends Activity {
     // OWNER/REPO подставляется автоматически при сборке в GitHub Actions
     static final String UPDATE_BASE = "https://raw.githubusercontent.com/OWNER/REPO/main/game/";
+    static final String ZIP_URL = "https://github.com/OWNER/REPO/releases/latest/download/game.zip";
     static final String MUSIC_API = "https://api.github.com/repos/OWNER/REPO/contents/game/music";
     static final int BUNDLED_VERSION = 19;
 
@@ -192,17 +197,25 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             try {
                 String json = httpString(UPDATE_BASE + "version.json?t=" + System.currentTimeMillis());
-                int remote = Integer.parseInt(json.replaceAll("[^0-9]", ""));
+                int remote; boolean zipMode = false;
+                try { JSONObject vj = new JSONObject(json.trim()); remote = vj.getInt("version"); zipMode = vj.optBoolean("zip", false); }
+                catch (Exception pe) { remote = Integer.parseInt(json.replaceAll("[^0-9]", "")); }
+                prefs.edit().putBoolean("zipmode", zipMode).apply();
+                final int rem = remote;
                 int have = hasLocal() ? curVersion() : BUNDLED_VERSION;
-                if (remote > have) {
-                    ui.post(() -> { status.setText("Скачивание обновления v" + remote + "…"); bar.setIndeterminate(false); bar.setProgress(0); });
-                    File tmp = new File(gameDir, "index.tmp");
-                    download(UPDATE_BASE + "index.html?t=" + System.currentTimeMillis(), tmp);
-                    File dst = new File(gameDir, "index.html");
-                    if (dst.exists()) dst.delete();
-                    if (!tmp.renameTo(dst)) throw new IOException("rename");
-                    prefs.edit().putInt("ver", remote).apply();
-                    ui.post(() -> { gameLoaded = false; status.setText("Обновлено до v" + remote + " ✓"); });
+                if (rem > have) {
+                    if (zipMode) {
+                        installZip(rem);
+                    } else {
+                        ui.post(() -> { status.setText("Скачивание обновления v" + rem + "…"); bar.setIndeterminate(false); bar.setProgress(0); });
+                        File tmp = new File(gameDir, "index.tmp");
+                        download(UPDATE_BASE + "index.html?t=" + System.currentTimeMillis(), tmp);
+                        File dst = new File(gameDir, "index.html");
+                        if (dst.exists()) dst.delete();
+                        if (!tmp.renameTo(dst)) throw new IOException("rename");
+                        prefs.edit().putInt("ver", rem).apply();
+                        ui.post(() -> { gameLoaded = false; status.setText("Обновлено до v" + rem + " ✓"); });
+                    }
                 } else {
                     ui.post(() -> status.setText("У вас последняя версия ✓"));
                 }
@@ -210,7 +223,7 @@ public class MainActivity extends Activity {
                 ui.post(() -> status.setText("Нет связи с сервером обновлений — запуск сохранённой версии"));
             }
             ui.post(() -> { updating = false; bar.setIndeterminate(false); bar.setProgress(100); play.setEnabled(true); refreshVersionLabel(); });
-            syncMusic();
+            if (!prefs.getBoolean("zipmode", false)) syncMusic();
             ui.post(() -> check.setEnabled(true));
         }).start();
     }
@@ -261,6 +274,78 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** Скачивает game.zip из последнего Release, распаковывает и заменяет папку игры. Вызывать из фонового потока. */
+    private void installZip(final int remote) throws IOException {
+        File zip = new File(getFilesDir(), "game_update.zip");
+        ui.post(() -> { status.setText("Скачивание игры v" + remote + "…"); bar.setIndeterminate(false); bar.setProgress(0); });
+        download(ZIP_URL, zip);
+        ui.post(() -> { status.setText("Распаковка…"); bar.setIndeterminate(true); });
+        File tmpDir = new File(getFilesDir(), "game_tmp");
+        deleteRec(tmpDir);
+        tmpDir.mkdirs();
+        String base = tmpDir.getCanonicalPath() + File.separator;
+        try (ZipInputStream zin = new ZipInputStream(new BufferedInputStream(new FileInputStream(zip), 65536))) {
+            ZipEntry e; byte[] buf = new byte[65536];
+            while ((e = zin.getNextEntry()) != null) {
+                File out = new File(tmpDir, e.getName());
+                if (!out.getCanonicalPath().startsWith(base)) continue;
+                if (e.isDirectory()) { out.mkdirs(); continue; }
+                out.getParentFile().mkdirs();
+                try (FileOutputStream fo = new FileOutputStream(out)) { int n; while ((n = zin.read(buf)) > 0) fo.write(buf, 0, n); }
+            }
+        }
+        zip.delete();
+        File root = tmpDir;
+        if (!new File(root, "index.html").exists()) {
+            File[] kids = tmpDir.listFiles();
+            if (kids != null && kids.length == 1 && kids[0].isDirectory() && new File(kids[0], "index.html").exists()) root = kids[0];
+        }
+        if (!new File(root, "index.html").exists()) { deleteRec(tmpDir); throw new IOException("в архиве нет index.html"); }
+        deleteRec(gameDir);
+        if (!root.renameTo(gameDir)) throw new IOException("rename");
+        deleteRec(tmpDir);
+        gameDir.mkdirs(); musicDir.mkdirs();
+        prefs.edit().putInt("ver", remote).apply();
+        ui.post(() -> { gameLoaded = false; status.setText("Обновлено до v" + remote + " ✓"); });
+    }
+
+    private void deleteRec(File f) {
+        if (f == null || !f.exists()) return;
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) deleteRec(k);
+        f.delete();
+    }
+
+    /** Отдаёт файлы из папки игры по адресу https://appassets.androidplatform.net/... с правильными типами. */
+    private class FileHandler implements WebViewAssetLoader.PathHandler {
+        private final File root;
+        FileHandler(File r) { root = r; }
+        @Override public WebResourceResponse handle(String path) {
+            Map<String, String> h = new HashMap<>();
+            h.put("Access-Control-Allow-Origin", "*");
+            try {
+                File f = new File(root, Uri.decode(path)).getCanonicalFile();
+                if (f.getPath().startsWith(root.getCanonicalPath() + File.separator) && f.isFile()) {
+                    String mime = mimeOf(f.getName());
+                    return new WebResourceResponse(mime, mime.startsWith("text/") || mime.endsWith("json") || mime.endsWith("javascript") ? "UTF-8" : null,
+                            200, "OK", h, new FileInputStream(f));
+                }
+            } catch (Exception ignored) { }
+            return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", h, new ByteArrayInputStream(new byte[0]));
+        }
+    }
+
+    private static String mimeOf(String name) {
+        String n = name.toLowerCase();
+        String[][] m = {{".html", "text/html"}, {".htm", "text/html"}, {".js", "text/javascript"}, {".mjs", "text/javascript"}, {".css", "text/css"},
+                {".json", "application/json"}, {".wasm", "application/wasm"}, {".glb", "model/gltf-binary"}, {".gltf", "model/gltf+json"},
+                {".png", "image/png"}, {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"}, {".webp", "image/webp"}, {".svg", "image/svg+xml"}, {".gif", "image/gif"},
+                {".mp3", "audio/mpeg"}, {".ogg", "audio/ogg"}, {".wav", "audio/wav"}, {".m4a", "audio/mp4"}, {".aac", "audio/aac"},
+                {".ttf", "font/ttf"}, {".woff", "font/woff"}, {".woff2", "font/woff2"}, {".txt", "text/plain"}};
+        for (String[] e : m) if (n.endsWith(e[0])) return e[1];
+        return "application/octet-stream";
+    }
+
     private String httpString(String u) throws IOException {
         HttpURLConnection c = open(u);
         try (InputStream in = c.getInputStream(); ByteArrayOutputStream o = new ByteArrayOutputStream()) {
@@ -293,10 +378,9 @@ public class MainActivity extends Activity {
     private WebView buildWebView() {
         WebView w = new WebView(this);
         final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()
-                .addPathHandler("/assets/music/", new WebViewAssetLoader.InternalStoragePathHandler(this, musicDir))
-                .addPathHandler("/game/music/", new WebViewAssetLoader.InternalStoragePathHandler(this, musicDir))
+                .addPathHandler("/assets/music/", new FileHandler(musicDir))
                 .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
-                .addPathHandler("/game/", new WebViewAssetLoader.InternalStoragePathHandler(this, gameDir))
+                .addPathHandler("/game/", new FileHandler(gameDir))
                 .build();
         WebSettings s = w.getSettings();
         s.setJavaScriptEnabled(true);
