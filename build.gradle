@@ -1,1 +1,24 @@
-plugins { id 'com.android.application' version '8.5.2' apply false }
+plugins { id 'com.android.application' }
+android {
+    namespace 'com.horizon.zakamye'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'com.horizon.zakamye'
+        minSdk 24
+        targetSdk 34
+        versionCode 21
+        versionName '1.1'
+    }
+    signingConfigs {
+        debug {
+            storeFile file('debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+    buildTypes { release { minifyEnabled false } }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    androidResources { noCompress 'html' }
+}
+dependencies { implementation 'androidx.webkit:webkit:1.11.0' }
