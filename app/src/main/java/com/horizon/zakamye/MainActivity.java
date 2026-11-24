@@ -25,6 +25,20 @@ import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.content.Context;
+import android.content.res.ColorStateList;
+import android.graphics.Path;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
+import android.text.style.StyleSpan;
+import android.widget.Switch;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -76,6 +90,13 @@ public class MainActivity extends Activity {
     private Runnable pendingAfterLoad;
     private boolean paused = false;
     private boolean gameLoaded = false, updating = false, inGame = false;
+    static final String TG_URL = "https://t.me/kyzore";
+    private TextView statsView;
+    private FrameLayout settingsOverlay;
+    private long sessionStart = 0;
+    private final Runnable tick = new Runnable() {
+        @Override public void run() { if (sessionStart > 0) { commitSession(); ui.postDelayed(this, 30000); } }
+    };
 
     @Override
     protected void onCreate(Bundle b) {
@@ -149,7 +170,11 @@ public class MainActivity extends Activity {
         card.addView(title);
         card.addView(sub, lp(0, 0));
         card.addView(verChip, lp(0, 16));
-        card.addView(status, lp(0, 22));
+        statsView = text("", 12, 0xCCFFFFFF, false);
+        statsView.setPadding(dp(14), dp(5), dp(14), dp(5));
+        statsView.setBackground(glass(dp(20), 0x24, 0x0C, 0x44));
+        card.addView(statsView, lp(0, 8));
+        card.addView(status, lp(0, 16));
         card.addView(bar, lp2(300, 8, 14));
         card.addView(row, lp2(400, 54, 24));
         restore = pill("Восстановить", false);
@@ -177,7 +202,24 @@ public class MainActivity extends Activity {
         launcher.addView(card, cp);
         root.addView(launcherRoot, new FrameLayout.LayoutParams(-1, -1));
         launcherRootView = launcherRoot;
+
+        // Telegram (правый верхний угол) и настройки левее него
+        IconBtn tg = new IconBtn(this, 0);
+        tg.setContentDescription("Telegram");
+        tg.setOnClickListener(v -> openTelegram());
+        FrameLayout.LayoutParams tgp = new FrameLayout.LayoutParams(dp(46), dp(46), Gravity.TOP | Gravity.END);
+        tgp.topMargin = dp(16); tgp.setMarginEnd(dp(20));
+        launcherRoot.addView(tg, tgp);
+        IconBtn cfg = new IconBtn(this, 1);
+        cfg.setContentDescription("Настройки");
+        cfg.setOnClickListener(v -> openSettings());
+        FrameLayout.LayoutParams cfp = new FrameLayout.LayoutParams(dp(46), dp(46), Gravity.TOP | Gravity.END);
+        cfp.topMargin = dp(16); cfp.setMarginEnd(dp(20 + 46 + 10));
+        launcherRoot.addView(cfg, cfp);
+        buildSettings(launcherRoot);
+
         refreshVersionLabel();
+        refreshStats();
 
         checkUpdate();
     }
@@ -409,6 +451,7 @@ public class MainActivity extends Activity {
         launcherRootView.setVisibility(View.GONE);
         web.onResume();
         inGame = true;
+        startSession();
     }
 
     private void loadGame() {
@@ -422,6 +465,8 @@ public class MainActivity extends Activity {
         web.setVisibility(View.GONE);
         launcherRootView.setVisibility(View.VISIBLE);
         inGame = false;
+        stopSession();
+        refreshStats();
         ui.postDelayed(() -> { if (!inGame) web.onPause(); }, 900);
     }
 
@@ -519,6 +564,186 @@ public class MainActivity extends Activity {
     }
 
 
+    // ---------- вибрация ----------
+    private void haptic() {
+        if (!prefs.getBoolean("haptic", true)) return;
+        try {
+            Vibrator vb = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+            if (vb == null || !vb.hasVibrator()) return;
+            if (Build.VERSION.SDK_INT >= 29) vb.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK));
+            else if (Build.VERSION.SDK_INT >= 26) vb.vibrate(VibrationEffect.createOneShot(20, 160));
+            else vb.vibrate(20);
+        } catch (Exception ignored) { }
+    }
+
+    // ---------- счётчик времени в игре ----------
+    private String todayKey() { return new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date()); }
+
+    private long todayMs() { return todayKey().equals(prefs.getString("pt_day", "")) ? prefs.getLong("pt_today", 0) : 0; }
+
+    private void addPlaytime(long d) {
+        String day = todayKey();
+        long today = day.equals(prefs.getString("pt_day", "")) ? prefs.getLong("pt_today", 0) : 0;
+        prefs.edit().putString("pt_day", day).putLong("pt_today", today + d)
+                .putLong("pt_total", prefs.getLong("pt_total", 0) + d).apply();
+    }
+
+    private void startSession() {
+        if (sessionStart > 0) return;
+        sessionStart = SystemClock.elapsedRealtime();
+        ui.removeCallbacks(tick);
+        ui.postDelayed(tick, 30000);
+    }
+
+    private void commitSession() {
+        if (sessionStart <= 0) return;
+        long now = SystemClock.elapsedRealtime(), d = now - sessionStart;
+        sessionStart = now;
+        if (d > 0) addPlaytime(d);
+    }
+
+    private void stopSession() {
+        commitSession();
+        sessionStart = 0;
+        ui.removeCallbacks(tick);
+    }
+
+    private String fmtTime(long ms) {
+        long m = ms / 60000;
+        if (m < 60) return m + " м";
+        return (m / 60) + " ч " + (m % 60) + " м";
+    }
+
+    private void refreshStats() {
+        String a = "Сегодня  ", b = fmtTime(todayMs()), c = "     •     Всего  ", d = fmtTime(prefs.getLong("pt_total", 0));
+        SpannableStringBuilder sb = new SpannableStringBuilder(a + b + c + d);
+        int[][] spans = {{a.length(), a.length() + b.length()}, {a.length() + b.length() + c.length(), sb.length()}};
+        for (int[] r : spans) {
+            sb.setSpan(new ForegroundColorSpan(cPrimary), r[0], r[1], Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            sb.setSpan(new StyleSpan(Typeface.BOLD), r[0], r[1], Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        statsView.setText(sb);
+    }
+
+    // ---------- Telegram ----------
+    private void openTelegram() {
+        try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(TG_URL))); }
+        catch (Exception e) { status.setText("Не удалось открыть Telegram"); }
+    }
+
+    // ---------- настройки ----------
+    private void buildSettings(FrameLayout parent) {
+        settingsOverlay = new FrameLayout(this);
+        settingsOverlay.setBackgroundColor(alpha(cBg, 0xCC));
+        settingsOverlay.setVisibility(View.GONE);
+        settingsOverlay.setClickable(true);
+        settingsOverlay.setOnClickListener(v -> closeSettings());
+
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setPadding(dp(24), dp(22), dp(24), dp(22));
+        GradientDrawable bgd = new GradientDrawable();
+        bgd.setColor(0xF0182019);
+        bgd.setCornerRadius(dp(28));
+        bgd.setStroke(Math.max(1, dp(1)), alpha(Color.WHITE, 0x44));
+        c.setBackground(bgd);
+        c.setClickable(true);
+
+        TextView t = text("Настройки", 20, Color.WHITE, true);
+        t.setGravity(Gravity.START);
+        c.addView(t);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout labels = new LinearLayout(this);
+        labels.setOrientation(LinearLayout.VERTICAL);
+        TextView l1 = text("Вибрация", 16, Color.WHITE, true);
+        l1.setGravity(Gravity.START);
+        TextView l2 = text("Отклик при нажатии кнопок", 12, 0xFFB5BDB7, false);
+        l2.setGravity(Gravity.START);
+        labels.addView(l1);
+        labels.addView(l2);
+        Switch sw = new Switch(this);
+        sw.setChecked(prefs.getBoolean("haptic", true));
+        int[][] st = {{android.R.attr.state_checked}, {}};
+        sw.setThumbTintList(new ColorStateList(st, new int[]{cPrimary, 0xFFB8C2BA}));
+        sw.setTrackTintList(new ColorStateList(st, new int[]{alpha(cPrimary, 0x80), alpha(Color.WHITE, 0x40)}));
+        sw.setOnCheckedChangeListener((b, on) -> { prefs.edit().putBoolean("haptic", on).apply(); haptic(); });
+        row.addView(labels, new LinearLayout.LayoutParams(0, -2, 1f));
+        row.addView(sw);
+        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(-1, -2);
+        rowLp.topMargin = dp(18);
+        c.addView(row, rowLp);
+
+        Button done = pill("Готово", true);
+        done.setOnClickListener(v -> closeSettings());
+        LinearLayout.LayoutParams doneLp = new LinearLayout.LayoutParams(-1, dp(48));
+        doneLp.topMargin = dp(20);
+        c.addView(done, doneLp);
+
+        settingsOverlay.addView(c, new FrameLayout.LayoutParams(dp(360), -2, Gravity.CENTER));
+        parent.addView(settingsOverlay, new FrameLayout.LayoutParams(-1, -1));
+    }
+
+    private void openSettings() {
+        settingsOverlay.setAlpha(0f);
+        settingsOverlay.setVisibility(View.VISIBLE);
+        settingsOverlay.animate().alpha(1f).setDuration(160).start();
+    }
+
+    private void closeSettings() {
+        settingsOverlay.animate().alpha(0f).setDuration(140).withEndAction(() -> settingsOverlay.setVisibility(View.GONE)).start();
+    }
+
+    /** круглая стеклянная иконка-кнопка: 0 = Telegram, 1 = настройки */
+    private class IconBtn extends View {
+        private final int kind;
+        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path path = new Path();
+        IconBtn(Context ctx, int kind) {
+            super(ctx);
+            this.kind = kind;
+            int base = kind == 0 ? cTertiary : Color.WHITE;
+            GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                    new int[]{alpha(base, kind == 0 ? 0x66 : 0x3A), alpha(base, kind == 0 ? 0x26 : 0x14)});
+            g.setShape(GradientDrawable.OVAL);
+            g.setStroke(Math.max(1, dp(1)), alpha(base, 0x99));
+            setBackground(g);
+            setClickable(true);
+            setOnTouchListener((v, e) -> {
+                if (e.getAction() == MotionEvent.ACTION_DOWN) { haptic(); v.animate().scaleX(.9f).scaleY(.9f).setDuration(90).start(); }
+                else if (e.getAction() == MotionEvent.ACTION_UP || e.getAction() == MotionEvent.ACTION_CANCEL) v.animate().scaleX(1f).scaleY(1f).setDuration(140).start();
+                return false;
+            });
+        }
+        @Override protected void onDraw(Canvas cv) {
+            float k = Math.min(getWidth(), getHeight()) / 24f * 0.58f;
+            cv.save();
+            cv.translate(getWidth() / 2f - 12 * k, getHeight() / 2f - 12 * k);
+            cv.scale(k, k);
+            if (kind == 0) {
+                path.reset();
+                path.moveTo(3.2f, 11.4f); path.lineTo(20.6f, 4.6f); path.lineTo(17.6f, 19.4f);
+                path.lineTo(12.8f, 15.5f); path.lineTo(9.9f, 18.4f); path.lineTo(9.7f, 13.6f); path.close();
+                p.setStyle(Paint.Style.FILL); p.setColor(Color.WHITE);
+                p.setStrokeJoin(Paint.Join.ROUND); p.setStrokeWidth(0.8f);
+                cv.drawPath(path, p);
+                p.setStyle(Paint.Style.STROKE); p.setStrokeCap(Paint.Cap.ROUND); p.setStrokeWidth(1.0f);
+                p.setColor(alpha(mix(cTertiary, cBg), 0xFF));
+                cv.drawLine(9.7f, 13.6f, 17.4f, 7.7f, p);
+            } else {
+                float[] ys = {7f, 12f, 17f}, xs = {9f, 15f, 11f};
+                p.setStyle(Paint.Style.STROKE); p.setStrokeCap(Paint.Cap.ROUND); p.setStrokeWidth(1.8f);
+                p.setColor(alpha(Color.WHITE, 0xAA));
+                for (float y : ys) cv.drawLine(3.5f, y, 20.5f, y, p);
+                p.setStyle(Paint.Style.FILL); p.setColor(cPrimary);
+                for (int i = 0; i < 3; i++) cv.drawCircle(xs[i], ys[i], 2.5f, p);
+            }
+            cv.restore();
+        }
+    }
+
     // ---------- дизайн: Material You + liquid glass ----------
     private void initColors() {
         // зелёная палитра в стиле Material 3 (тёмная тема)
@@ -571,7 +796,7 @@ public class MainActivity extends Activity {
             b.setTextColor(Color.WHITE);
         }
         b.setOnTouchListener((v, e) -> {
-            if (e.getAction() == MotionEvent.ACTION_DOWN) v.animate().scaleX(.95f).scaleY(.95f).setDuration(90).start();
+            if (e.getAction() == MotionEvent.ACTION_DOWN) { if (v.isEnabled()) haptic(); v.animate().scaleX(.95f).scaleY(.95f).setDuration(90).start(); }
             else if (e.getAction() == MotionEvent.ACTION_UP || e.getAction() == MotionEvent.ACTION_CANCEL) v.animate().scaleX(1f).scaleY(1f).setDuration(140).start();
             return false;
         });
@@ -622,10 +847,13 @@ public class MainActivity extends Activity {
 
     @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) immersive(); }
     @Override protected void onPause() {
-        super.onPause(); paused = true; exportSave();
+        super.onPause(); paused = true; stopSession(); exportSave();
         ui.postDelayed(() -> { if (paused) web.onPause(); }, 900);
     }
-    @Override protected void onResume() { super.onResume(); paused = false; if (inGame) web.onResume(); immersive(); }
-    @Override protected void onDestroy() { web.destroy(); super.onDestroy(); }
-    @Override public void onBackPressed() { if (inGame) showLauncher(); else super.onBackPressed(); }
+    @Override protected void onResume() { super.onResume(); paused = false; if (inGame) { web.onResume(); startSession(); } immersive(); }
+    @Override protected void onDestroy() { stopSession(); web.destroy(); super.onDestroy(); }
+    @Override public void onBackPressed() {
+        if (settingsOverlay != null && settingsOverlay.getVisibility() == View.VISIBLE) closeSettings();
+        else if (inGame) showLauncher(); else super.onBackPressed();
+    }
 }
